@@ -11,10 +11,13 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- CORS CONFIGURATION ---
-# Removed localhost/127.0.0.1. Only specific domains allowed.
+# Allow your specific domains. 
+# You can add 'http://localhost:3000' or similar for local testing if needed.
 allowed_origins = [
     "https://armor.shop",
-    "https://staging.armor.shop"
+    "https://staging.armor.shop",
+    "http://127.0.0.1:5500", # Example for local testing
+    "http://localhost:3000"
 ]
 
 CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
@@ -23,6 +26,7 @@ CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
 API_TOKEN = os.getenv('JUDGE_ME_API_TOKEN')
 SHOP_DOMAIN = os.getenv('SHOP_DOMAIN')
 
+# Helper: Clean shop domain
 if SHOP_DOMAIN:
     SHOP_DOMAIN = SHOP_DOMAIN.replace("https://", "").replace("http://", "").strip("/")
 
@@ -30,8 +34,8 @@ if SHOP_DOMAIN:
 
 def fetch_all_shop_reviews():
     """
-    Fetches ALL reviews from the shop to ensure we can filter by handle client-side
-    (since the API handle filter can be inconsistent or limited).
+    Fetches EVERY review from the shop to handle client-side filtering.
+    Loops through all pages until no more reviews are returned.
     """
     url = "https://judge.me/api/v1/reviews"
     all_reviews = []
@@ -52,7 +56,7 @@ def fetch_all_shop_reviews():
             res = requests.get(url, params=params)
             
             if res.status_code != 200:
-                print(f"Error on Page {page}: {res.status_code}")
+                print(f"Error on Page {page}: {res.status_code} | {res.text}")
                 break
             
             data = res.json()
@@ -63,11 +67,12 @@ def fetch_all_shop_reviews():
             
             all_reviews.extend(current_batch)
             
+            # Optimization: If fewer reviews than limit, we are on the last page
             if len(current_batch) < per_page:
                 break
                 
             page += 1
-            time.sleep(0.1) 
+            time.sleep(0.1) # Be nice to the API
             
         except Exception as e:
             print(f"Exception fetching reviews: {e}")
@@ -78,7 +83,7 @@ def fetch_all_shop_reviews():
 
 def calculate_stats(reviews):
     """
-    Calculates stats (average, count, distribution) only for the filtered list.
+    Calculates stats (average, count, distribution) for the filtered list.
     """
     count = len(reviews)
     if count == 0:
@@ -116,7 +121,7 @@ def calculate_stats(reviews):
 
 @app.route('/api/product-reviews', methods=['GET'])
 def get_reviews_route():
-    # 1. Get handle
+    # 1. Get handle from request
     target_handle = request.args.get('handle')
     if not target_handle:
         return jsonify({"error": "Missing 'handle' parameter"}), 400
@@ -133,7 +138,6 @@ def get_reviews_route():
             continue
             
         # B. Filter by Published Status
-        # Only allow if published is explictly True
         if r.get('published') is not True:
             continue
             
@@ -142,25 +146,45 @@ def get_reviews_route():
     # 4. Calculate Stats (on filtered data only)
     stats = calculate_stats(filtered_reviews)
     
-    # 5. Format Data for Display
+    # 5. Format Data for Frontend
     clean_reviews = []
     for r in filtered_reviews:
-        # Extract Media
         media = []
+        
+        # --- A. Process Images ---
         if r.get('pictures'):
             for p in r['pictures']:
-                urls = p.get('urls', {})
-                img_url = urls.get('original') or urls.get('huge')
-                if img_url: 
-                    media.append({"type": "image", "url": img_url})
+                url = None
+                # Check for nested 'urls' dict (standard Judge.me API)
+                if isinstance(p, dict) and 'urls' in p:
+                    url = p['urls'].get('original') or p['urls'].get('huge')
+                # Fallback for simple structure
+                elif isinstance(p, dict) and 'url' in p:
+                    url = p['url']
+                
+                if url: 
+                    media.append({"type": "image", "url": url})
 
-        # Extract Reviewer Name
+        # --- B. Process Videos (NEW) ---
+        # Note: Judge.me usually puts videos in a separate 'videos' array
+        if r.get('videos'):
+            for v in r['videos']:
+                # Prefer 'url' or 'original_url'
+                video_url = v.get('url') or v.get('original_url')
+                if video_url:
+                    media.append({"type": "video", "url": video_url})
+
+        # --- C. Clean Author Name ---
         reviewer_data = r.get('reviewer', {})
         author_name = reviewer_data.get('name', 'Anonymous')
+        
+        # Logic to replace "Anonymous" with a better label if desired
+        if author_name.strip().lower() == 'anonymous':
+            author_name = "Verified Buyer"
+
         initials = author_name[0].upper() if author_name else "A"
         
-        # Determine Verification Status
-        # Based on your JSON, verified can be 'nothing', 'email', 'confirmed-buyer' etc.
+        # --- D. Verification Status ---
         raw_verified = r.get('verified', 'nothing')
         is_verified = raw_verified in ['buyer', 'verified_buyer', 'confirmed-buyer', 'verified-purchase', 'email']
 
@@ -174,7 +198,6 @@ def get_reviews_route():
             "is_verified": is_verified,
             "date": r.get('created_at'),
             "media": media,
-            # We keep the raw string in case you need to debug or show specific badges later
             "verification_type": raw_verified
         })
 
