@@ -9,14 +9,20 @@ from dotenv import load_dotenv
 load_dotenv()
 
 app = Flask(__name__)
-# Enable CORS to allow your frontend to communicate with this backend
-CORS(app)
 
-# Credentials from .env file
+# --- CORS CONFIGURATION ---
+# Removed localhost/127.0.0.1. Only specific domains allowed.
+allowed_origins = [
+    "https://armor.shop",
+    "https://staging.armor.shop"
+]
+
+CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+
+# Credentials
 API_TOKEN = os.getenv('JUDGE_ME_API_TOKEN')
 SHOP_DOMAIN = os.getenv('SHOP_DOMAIN')
 
-# Helper: Clean shop domain string
 if SHOP_DOMAIN:
     SHOP_DOMAIN = SHOP_DOMAIN.replace("https://", "").replace("http://", "").strip("/")
 
@@ -24,13 +30,13 @@ if SHOP_DOMAIN:
 
 def fetch_all_shop_reviews():
     """
-    Fetches EVERY review from the shop by looping through pages.
-    We fetch everything first because the API's handle filtering can be inconsistent.
+    Fetches ALL reviews from the shop to ensure we can filter by handle client-side
+    (since the API handle filter can be inconsistent or limited).
     """
     url = "https://judge.me/api/v1/reviews"
     all_reviews = []
     page = 1
-    per_page = 100 # Maximum allowed per page
+    per_page = 100 
     
     print(f"--- Starting Fetch for {SHOP_DOMAIN} ---")
 
@@ -45,25 +51,22 @@ def fetch_all_shop_reviews():
         try:
             res = requests.get(url, params=params)
             
-            # Check for API errors
             if res.status_code != 200:
-                print(f"Error on Page {page}: Status {res.status_code} | {res.text}")
+                print(f"Error on Page {page}: {res.status_code}")
                 break
             
             data = res.json()
             current_batch = data.get('reviews', [])
             
             if not current_batch:
-                break # No more reviews
+                break 
             
             all_reviews.extend(current_batch)
             
-            # Optimization: If we received fewer reviews than requested, it's the last page
             if len(current_batch) < per_page:
                 break
                 
             page += 1
-            # Slight delay to respect API rate limits
             time.sleep(0.1) 
             
         except Exception as e:
@@ -75,7 +78,7 @@ def fetch_all_shop_reviews():
 
 def calculate_stats(reviews):
     """
-    Calculates average rating and star distribution for the filtered list.
+    Calculates stats (average, count, distribution) only for the filtered list.
     """
     count = len(reviews)
     if count == 0:
@@ -89,14 +92,12 @@ def calculate_stats(reviews):
     total_sum = 0
     
     for r in reviews:
-        # Safely get rating
         rating = r.get('rating', 5)
         try:
             rating = int(rating)
         except:
             rating = 5
             
-        # Ensure rating is within bounds 1-5
         if rating < 1: rating = 1
         if rating > 5: rating = 5
             
@@ -115,76 +116,57 @@ def calculate_stats(reviews):
 
 @app.route('/api/product-reviews', methods=['GET'])
 def get_reviews_route():
-    # 1. Get the handle from the frontend request (e.g., ?handle=version-h1)
+    # 1. Get handle
     target_handle = request.args.get('handle')
-    
     if not target_handle:
         return jsonify({"error": "Missing 'handle' parameter"}), 400
 
-    # 2. Fetch ALL raw reviews from Judge.me
+    # 2. Fetch All Raw Data
     raw_reviews = fetch_all_shop_reviews()
     
-    # 3. Filter reviews based on Logic
-    #    - Must match product_handle
-    #    - Must be published (published == true)
+    # 3. Filter Logic
     filtered_reviews = []
     
-    print(f"Filtering for handle: '{target_handle}'...")
-    
     for r in raw_reviews:
-        # Check Handle
-        r_handle = r.get('product_handle')
-        if r_handle != target_handle:
+        # A. Filter by Product Handle
+        if r.get('product_handle') != target_handle:
             continue
             
-        # Check Published Status
-        is_published = r.get('published')
-        if is_published is not True:
+        # B. Filter by Published Status
+        # Only allow if published is explictly True
+        if r.get('published') is not True:
             continue
             
-        # If passed, add to list
         filtered_reviews.append(r)
 
-    print(f"Matches found: {len(filtered_reviews)}")
-
-    # 4. Calculate Stats on the Cleaned List
+    # 4. Calculate Stats (on filtered data only)
     stats = calculate_stats(filtered_reviews)
     
-    # 5. Format the Response (Map fields from your JSON)
+    # 5. Format Data for Display
     clean_reviews = []
     for r in filtered_reviews:
-        
-        # A. Extract Media (Images/Videos)
-        # Based on your JSON, pictures is an array of objects with 'urls'
+        # Extract Media
         media = []
         if r.get('pictures'):
             for p in r['pictures']:
-                # Safely access nested dictionary keys
                 urls = p.get('urls', {})
-                # Use 'original' size, fallback to 'huge'
                 img_url = urls.get('original') or urls.get('huge')
-                
                 if img_url: 
-                    media.append({
-                        "type": "image", 
-                        "url": img_url
-                    })
+                    media.append({"type": "image", "url": img_url})
 
-        # B. Handle Reviewer Name
+        # Extract Reviewer Name
         reviewer_data = r.get('reviewer', {})
         author_name = reviewer_data.get('name', 'Anonymous')
-        # Create initials (e.g. "John Doe" -> "J")
         initials = author_name[0].upper() if author_name else "A"
-
-        # C. Handle Verification Status
-        # Map specific API strings to a simple boolean
+        
+        # Determine Verification Status
+        # Based on your JSON, verified can be 'nothing', 'email', 'confirmed-buyer' etc.
         raw_verified = r.get('verified', 'nothing')
-        is_verified = raw_verified in ['buyer', 'verified_buyer', 'confirmed-buyer', 'email', 'verified-purchase']
+        is_verified = raw_verified in ['buyer', 'verified_buyer', 'confirmed-buyer', 'verified-purchase', 'email']
 
-        # D. Build the clean object
         clean_reviews.append({
             "id": r.get('id'),
-            "title": r.get('title'), # Might be null
+            "title": r.get('title'),
             "body": r.get('body'),
             "rating": int(r.get('rating', 5)),
             "author": author_name,
@@ -192,16 +174,14 @@ def get_reviews_route():
             "is_verified": is_verified,
             "date": r.get('created_at'),
             "media": media,
-            # Pass original verification string just in case frontend needs it
-            "verification_type": raw_verified 
+            # We keep the raw string in case you need to debug or show specific badges later
+            "verification_type": raw_verified
         })
 
-    # 6. Return the final JSON structure
     return jsonify({
         "stats": stats,
         "reviews": clean_reviews
     })
 
 if __name__ == '__main__':
-    # Run on port 5000
     app.run(debug=True, port=5000)
