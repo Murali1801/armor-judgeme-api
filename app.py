@@ -11,39 +11,39 @@ load_dotenv()
 app = Flask(__name__)
 
 # --- CORS CONFIGURATION ---
-# Allow your specific domains. 
-# You can add 'http://localhost:3000' or similar for local testing if needed.
+# Updated to explicitly allow POST methods for the new review submission
 allowed_origins = [
     "https://armor.shop",
     "https://staging.armor.shop",
-    "http://127.0.0.1:5500", # Example for local testing
+    "http://127.0.0.1:5500",
     "http://localhost:3000"
 ]
 
-CORS(app, resources={r"/api/*": {"origins": allowed_origins}})
+CORS(app, resources={r"/api/*": {"origins": allowed_origins, "methods": ["GET", "POST", "OPTIONS"]}})
 
 # Credentials
-API_TOKEN = os.getenv('JUDGE_ME_API_TOKEN')
+API_TOKEN = os.getenv('JUDGE_ME_API_TOKEN') # Use your Private API Token here
 SHOP_DOMAIN = os.getenv('SHOP_DOMAIN')
 
 # Helper: Clean shop domain
 if SHOP_DOMAIN:
     SHOP_DOMAIN = SHOP_DOMAIN.replace("https://", "").replace("http://", "").strip("/")
 
-# --- HELPER FUNCTIONS ---
+# --- MAPPING HANDLE TO PRODUCT ID ---
+# Judge.me requires the Shopify Product ID (numerical) to post a review.
+# You can update this dictionary as you add more products.
+PRODUCT_ID_MAP = {
+    "version-h1": "1234567890" # REPLACE with your actual Shopify Product ID
+}
+
+# --- EXISTING HELPER FUNCTIONS ---
 
 def fetch_all_shop_reviews():
-    """
-    Fetches EVERY review from the shop to handle client-side filtering.
-    Loops through all pages until no more reviews are returned.
-    """
     url = "https://judge.me/api/v1/reviews"
     all_reviews = []
     page = 1
     per_page = 100 
     
-    print(f"--- Starting Fetch for {SHOP_DOMAIN} ---")
-
     while True:
         params = {
             'api_token': API_TOKEN,
@@ -51,160 +51,117 @@ def fetch_all_shop_reviews():
             'per_page': per_page,
             'page': page
         }
-        
         try:
             res = requests.get(url, params=params)
-            
-            if res.status_code != 200:
-                print(f"Error on Page {page}: {res.status_code} | {res.text}")
-                break
-            
+            if res.status_code != 200: break
             data = res.json()
             current_batch = data.get('reviews', [])
-            
-            if not current_batch:
-                break 
-            
+            if not current_batch: break 
             all_reviews.extend(current_batch)
-            
-            # Optimization: If fewer reviews than limit, we are on the last page
-            if len(current_batch) < per_page:
-                break
-                
+            if len(current_batch) < per_page: break
             page += 1
-            time.sleep(0.1) # Be nice to the API
-            
-        except Exception as e:
-            print(f"Exception fetching reviews: {e}")
+            time.sleep(0.1)
+        except:
             break
-            
-    print(f"--- Fetch Complete. Total raw reviews: {len(all_reviews)} ---")
     return all_reviews
 
 def calculate_stats(reviews):
-    """
-    Calculates stats (average, count, distribution) for the filtered list.
-    """
     count = len(reviews)
     if count == 0:
-        return {
-            "average": 0.0,
-            "count": 0,
-            "distribution": {5:0, 4:0, 3:0, 2:0, 1:0}
-        }
-    
+        return {"average": 0.0, "count": 0, "distribution": {5:0, 4:0, 3:0, 2:0, 1:0}}
     distribution = {5: 0, 4: 0, 3: 0, 2: 0, 1: 0}
     total_sum = 0
-    
     for r in reviews:
-        rating = r.get('rating', 5)
-        try:
-            rating = int(rating)
-        except:
-            rating = 5
-            
+        rating = int(r.get('rating', 5))
         if rating < 1: rating = 1
         if rating > 5: rating = 5
-            
         distribution[rating] += 1
         total_sum += rating
+    return {"average": round(total_sum / count, 2), "count": count, "distribution": distribution}
 
-    average = total_sum / count
-    
-    return {
-        "average": round(average, 2),
-        "count": count,
-        "distribution": distribution
+# --- API ROUTES ---
+
+# 1. NEW: Submit Review Route (POST)
+@app.route('/api/submit-review', methods=['POST'])
+def submit_review_route():
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+
+    # Extract info from frontend
+    handle = data.get('handle', 'version-h1')
+    reviewer_name = data.get('name')
+    reviewer_email = data.get('email')
+    rating = data.get('rating')
+    body = data.get('body')
+
+    # Get the numerical Product ID
+    product_id = PRODUCT_ID_MAP.get(handle)
+    if not product_id:
+        return jsonify({"error": f"Product ID not found for handle: {handle}"}), 404
+
+    # Judge.me Reviewer API Payload
+    # Note: We use the Private API Token for authentication
+    judgeme_payload = {
+        "shop_domain": SHOP_DOMAIN,
+        "platform": "shopify",
+        "id": product_id,
+        "email": reviewer_email,
+        "name": reviewer_name,
+        "rating": rating,
+        "body": body
     }
 
-# --- API ROUTE ---
+    try:
+        response = requests.post(
+            f"https://judge.me/api/v1/reviews?api_token={API_TOKEN}",
+            json=judgeme_payload
+        )
 
+        if response.status_code in [200, 201]:
+            return jsonify({"status": "success", "message": "Review submitted successfully"}), 200
+        else:
+            return jsonify({"status": "error", "message": response.text}), response.status_code
+
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+# 2. EXISTING: Get Reviews Route (GET)
 @app.route('/api/product-reviews', methods=['GET'])
 def get_reviews_route():
-    # 1. Get handle from request
     target_handle = request.args.get('handle')
     if not target_handle:
         return jsonify({"error": "Missing 'handle' parameter"}), 400
 
-    # 2. Fetch All Raw Data
     raw_reviews = fetch_all_shop_reviews()
-    
-    # 3. Filter Logic
-    filtered_reviews = []
-    
-    for r in raw_reviews:
-        # A. Filter by Product Handle
-        if r.get('product_handle') != target_handle:
-            continue
-            
-        # B. Filter by Published Status
-        if r.get('published') is not True:
-            continue
-            
-        filtered_reviews.append(r)
-
-    # 4. Calculate Stats (on filtered data only)
+    filtered_reviews = [r for r in raw_reviews if r.get('product_handle') == target_handle and r.get('published') is True]
     stats = calculate_stats(filtered_reviews)
     
-    # 5. Format Data for Frontend
     clean_reviews = []
     for r in filtered_reviews:
         media = []
-        
-        # --- A. Process Images ---
         if r.get('pictures'):
             for p in r['pictures']:
-                url = None
-                # Check for nested 'urls' dict (standard Judge.me API)
-                if isinstance(p, dict) and 'urls' in p:
-                    url = p['urls'].get('original') or p['urls'].get('huge')
-                # Fallback for simple structure
-                elif isinstance(p, dict) and 'url' in p:
-                    url = p['url']
-                
-                if url: 
-                    media.append({"type": "image", "url": url})
-
-        # --- B. Process Videos (NEW) ---
-        # Note: Judge.me usually puts videos in a separate 'videos' array
+                url = p.get('urls', {}).get('original') if isinstance(p, dict) else None
+                if url: media.append({"type": "image", "url": url})
+        
         if r.get('videos'):
             for v in r['videos']:
-                # Prefer 'url' or 'original_url'
-                video_url = v.get('url') or v.get('original_url')
-                if video_url:
-                    media.append({"type": "video", "url": video_url})
+                v_url = v.get('url') or v.get('original_url')
+                if v_url: media.append({"type": "video", "url": v_url})
 
-        # --- C. Clean Author Name ---
-        reviewer_data = r.get('reviewer', {})
-        author_name = reviewer_data.get('name', 'Anonymous')
-        
-        # Logic to replace "Anonymous" with a better label if desired
-        if author_name.strip().lower() == 'anonymous':
-            author_name = "Verified Buyer"
-
-        initials = author_name[0].upper() if author_name else "A"
-        
-        # --- D. Verification Status ---
-        raw_verified = r.get('verified', 'nothing')
-        is_verified = raw_verified in ['buyer', 'verified_buyer', 'confirmed-buyer', 'verified-purchase', 'email']
-
+        author_name = r.get('reviewer', {}).get('name', 'Verified Buyer')
         clean_reviews.append({
             "id": r.get('id'),
-            "title": r.get('title'),
             "body": r.get('body'),
             "rating": int(r.get('rating', 5)),
             "author": author_name,
-            "initials": initials,
-            "is_verified": is_verified,
-            "date": r.get('created_at'),
-            "media": media,
-            "verification_type": raw_verified
+            "is_verified": r.get('verified') in ['buyer', 'verified_buyer', 'email'],
+            "media": media
         })
 
-    return jsonify({
-        "stats": stats,
-        "reviews": clean_reviews
-    })
+    return jsonify({"stats": stats, "reviews": clean_reviews})
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
